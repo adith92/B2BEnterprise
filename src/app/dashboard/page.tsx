@@ -31,6 +31,17 @@ export default function Dashboard() {
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const [printDate, setPrintDate] = useState<string>('');
 
+  // Enhanced dynamic headers & OAuth integration states
+  const [columns, setColumns] = useState<string[]>([]);
+  const [isLoggedIn, setIsLoggedIn] = useState<boolean>(false);
+  const [connectedUser, setConnectedUser] = useState<{ name: string; email: string; picture?: string } | null>(null);
+  const [isMockSession, setIsMockSession] = useState<boolean>(false);
+  const [driveFiles, setDriveFiles] = useState<any[]>([]);
+  const [loadingDrive, setLoadingDrive] = useState<boolean>(false);
+  const [isDriveDropdownOpen, setIsDriveDropdownOpen] = useState<boolean>(false);
+  const [isEditingForm, setIsEditingForm] = useState<boolean>(false);
+  const [formValues, setFormValues] = useState<Record<string, string>>({});
+
   // Set print date on mount (client-side only to prevent hydration mismatch)
   useEffect(() => {
     const today = new Date();
@@ -57,6 +68,77 @@ export default function Dashboard() {
     }
   }, [toast]);
 
+  // Fetch Google Auth Session on mount
+  useEffect(() => {
+    async function fetchSession() {
+      try {
+        const res = await fetch('/api/auth/google/session');
+        const data = await res.json();
+        if (data.isAuthenticated) {
+          setIsLoggedIn(true);
+          setConnectedUser(data.user);
+          setIsMockSession(data.isMock);
+          
+          // Fetch Drive spreadsheets
+          try {
+            setLoadingDrive(true);
+            const driveRes = await fetch('/api/drive/spreadsheets');
+            const driveData = await driveRes.json();
+            if (driveData.success && driveData.files) {
+              setDriveFiles(driveData.files);
+            }
+          } catch (driveErr) {
+            console.error('Error fetching drive files:', driveErr);
+          } finally {
+            setLoadingDrive(false);
+          }
+        } else {
+          setIsLoggedIn(false);
+          setConnectedUser(null);
+          setIsMockSession(false);
+          setDriveFiles([]);
+        }
+      } catch (err) {
+        console.error('Error fetching auth session on mount:', err);
+      }
+    }
+    fetchSession();
+  }, []);
+
+  const handleConnectGoogle = async () => {
+    try {
+      const res = await fetch('/api/auth/google/url');
+      const data = await res.json();
+      if (data.url) {
+        window.location.href = data.url;
+      } else {
+        setToast({ message: 'Aduh, gagal mendapatkan URL login Google.', type: 'error' });
+      }
+    } catch (err) {
+      console.error('Error getting auth URL:', err);
+      setToast({ message: 'Aduh, koneksi gagal.', type: 'error' });
+    }
+  };
+
+  const handleDisconnectGoogle = async () => {
+    try {
+      const res = await fetch('/api/auth/google/logout', { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        setIsLoggedIn(false);
+        setConnectedUser(null);
+        setDriveFiles([]);
+        setIsMockSession(false);
+        setToast({ message: 'Koneksi dengan Google Drive berhasil diputuskan.', type: 'success' });
+      } else {
+        setToast({ message: 'Aduh, gagal memutuskan koneksi.', type: 'error' });
+      }
+    } catch (err) {
+      console.error('Error logging out:', err);
+      setToast({ message: 'Aduh, koneksi gagal.', type: 'error' });
+    }
+  };
+
   // Fetch all sheet tabs on mount
   useEffect(() => {
     async function fetchTabs() {
@@ -80,19 +162,22 @@ export default function Dashboard() {
 
   // Fetch and normalize rows whenever selectedTab changes
   const fetchRows = async (tabName: string) => {
-    if (!tabName) return;
+    if (!tabName) return [];
     try {
       setLoading(true);
       const res = await fetch(`/api/sheets/rows?sheet=${encodeURIComponent(tabName)}`);
       const data = await res.json();
       if (data.success && data.records) {
         setRecords(data.records);
+        setColumns(data.columns || []);
+        return data.records as BillingRecord[];
       }
     } catch (err) {
       console.error(`Gagal mengambil data baris untuk tab ${tabName}:`, err);
     } finally {
       setLoading(false);
     }
+    return [];
   };
 
   const handleTogglePayment = async () => {
@@ -122,11 +207,14 @@ export default function Dashboard() {
           type: 'success',
         });
         
-        // Auto-update active drawer details representation immediately
-        setSelectedRecord((prev) => (prev ? { ...prev, isPaid: targetIsPaid } : null));
-        
-        // Auto-refresh the dashboard records list instantly
-        await fetchRows(selectedTab);
+        // Auto-refresh the dashboard records list instantly and update active drawer details representation
+        const updatedList = await fetchRows(selectedTab);
+        const refreshed = updatedList.find((r) => r.rowNumber === selectedRecord.rowNumber);
+        if (refreshed) {
+          setSelectedRecord(refreshed);
+        } else {
+          setSelectedRecord((prev) => (prev ? { ...prev, isPaid: targetIsPaid } : null));
+        }
       } else {
         setToast({
           message: data.error || 'Waduh, gagal memperbarui status pembayaran. Coba lagi ya!',
@@ -142,6 +230,118 @@ export default function Dashboard() {
     } finally {
       setIsUpdating(false);
     }
+  };
+
+  // Sync state when details drawer opens
+  useEffect(() => {
+    if (selectedRecord) {
+      setFormValues(selectedRecord.raw);
+      setIsEditingForm(false);
+    } else {
+      setFormValues({});
+      setIsEditingForm(false);
+    }
+  }, [selectedRecord]);
+
+  const handleInputChange = (colName: string, value: string) => {
+    setFormValues((prev) => ({
+      ...prev,
+      [colName]: value,
+    }));
+  };
+
+  const handleSaveRowForm = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedRecord || !selectedTab) return;
+    setIsUpdating(true);
+    try {
+      const res = await fetch('/api/sheets/update-row', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          sheetName: selectedTab,
+          rowNumber: selectedRecord.rowNumber,
+          updatedValues: formValues,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (res.ok && data.success) {
+        setToast({
+          message: 'Mantap bro, data baris berhasil disimpan secara dinamis! 💾',
+          type: 'success',
+        });
+        setIsEditingForm(false);
+
+        // Dynamic refresh
+        const updatedList = await fetchRows(selectedTab);
+        const refreshed = updatedList.find((r) => r.rowNumber === selectedRecord.rowNumber);
+        if (refreshed) {
+          setSelectedRecord(refreshed);
+        }
+      } else {
+        setToast({
+          message: data.error || 'Waduh, gagal menyimpan perubahan data baris.',
+          type: 'error',
+        });
+      }
+    } catch (err) {
+      console.error('Error saving row form:', err);
+      setToast({
+        message: 'Aduh, koneksi bermasalah. Gagal menyimpan perubahan data baris!',
+        type: 'error',
+      });
+    } finally {
+      setIsUpdating(false);
+    }
+  };
+
+  // Helper to reorder Nomor Pembayaran adjacent to Nama
+  const getTableColumns = () => {
+    if (columns.length === 0) {
+      return ['Nama', 'Nomor Pembayaran', 'Metode Pembayaran', 'Nominal', 'Status'];
+    }
+
+    const list = [...columns];
+
+    const nameIdx = list.findIndex((col) => {
+      const label = col.toLowerCase();
+      return (
+        label.includes('nama') ||
+        label.includes('name') ||
+        label.includes('description') ||
+        label.includes('deskripsi') ||
+        label.includes('keterangan') ||
+        label.includes('listrik') ||
+        label.includes('rincian')
+      );
+    });
+
+    const pNumIdx = list.findIndex((col) => {
+      const label = col.toLowerCase();
+      return (
+        label.includes('nomor pembayaran') ||
+        label.includes('no pembayaran') ||
+        label.includes('payment number') ||
+        label.includes('payment_number') ||
+        label.includes('payment no')
+      );
+    });
+
+    if (nameIdx !== -1 && pNumIdx !== -1) {
+      const pNumCol = list[pNumIdx];
+      // remove
+      list.splice(pNumIdx, 1);
+      // find name's new index after splice
+      const newNameIdx = list.indexOf(columns[nameIdx]);
+      // insert adjacent to name
+      list.splice(newNameIdx + 1, 0, pNumCol);
+    }
+
+    return list;
   };
 
   useEffect(() => {
@@ -163,8 +363,11 @@ export default function Dashboard() {
 
   // Filtered records
   const filteredRecords = records.filter((r) => {
-    const matchesSearch = r.description?.toLowerCase().includes(searchQuery.toLowerCase()) || 
-                          r.category?.toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesSearch =
+      r.name?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      r.category?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      r.paymentNumber?.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      r.paymentMethod?.toLowerCase().includes(searchQuery.toLowerCase());
     
     if (statusFilter === 'paid') {
       return matchesSearch && r.isPaid;
@@ -232,6 +435,111 @@ export default function Dashboard() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* OAUTH CONNECTIVITY HEADER PANEL */}
+      <div className="glass-panel p-4 rounded-3xl mb-6 flex flex-col md:flex-row items-center justify-between gap-4 border border-slate-100 dark:border-slate-800 bg-white/70 dark:bg-slate-950/70 backdrop-blur-xl shadow-sm print:hidden">
+        <div className="flex items-center gap-3">
+          <div className="p-2.5 bg-indigo-50 dark:bg-indigo-950/30 text-indigo-500 rounded-2xl flex-shrink-0">
+            <svg className="w-6 h-6" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM19 18H6c-2.21 0-4-1.79-4-4 0-2.05 1.53-3.76 3.56-3.97l1.07-.11.5-.95C8.08 7.14 9.94 6 12 6c2.62 0 4.88 1.86 5.39 4.43l.3 1.5 1.53.11c1.56.1 2.78 1.41 2.78 2.96 0 1.65-1.35 3-3 3z"/>
+            </svg>
+          </div>
+          <div>
+            <h4 className="text-sm font-extrabold text-slate-800 dark:text-slate-200">
+              Konektivitas Google Drive ☁️
+            </h4>
+            <p className="text-xs text-slate-500">
+              {isLoggedIn 
+                ? `Terhubung dengan akun ${connectedUser?.email || ''}${isMockSession ? ' (Mock)' : ''}` 
+                : 'Hubungkan Google Drive untuk memindai file tagihan secara langsung.'}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3 w-full md:w-auto justify-end">
+          {isLoggedIn ? (
+            <>
+              {/* Dropdown Drive Files */}
+              <div className="relative">
+                <button
+                  onClick={() => setIsDriveDropdownOpen(!isDriveDropdownOpen)}
+                  className="flex items-center gap-2 px-3 py-2 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition"
+                >
+                  📁 Drive Spreadsheet Files
+                  <ChevronDown className="w-3.5 h-3.5" />
+                </button>
+
+                <AnimatePresence>
+                  {isDriveDropdownOpen && (
+                    <>
+                      <div className="fixed inset-0 z-10" onClick={() => setIsDriveDropdownOpen(false)} />
+                      <motion.div
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: 10 }}
+                        className="absolute right-0 mt-2 w-64 bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-xl z-25 overflow-hidden py-1 divide-y divide-slate-100 dark:divide-slate-900"
+                      >
+                        <div className="px-3.5 py-2 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                          Pilih Spreadsheet di Drive
+                        </div>
+                        {loadingDrive ? (
+                          <div className="px-3.5 py-2.5 text-xs text-slate-400">Loading spreadsheets...</div>
+                        ) : driveFiles.length === 0 ? (
+                          <div className="px-3.5 py-2.5 text-xs text-slate-400">No spreadsheets found</div>
+                        ) : (
+                          driveFiles.map((file) => (
+                            <button
+                              key={file.id}
+                              onClick={() => {
+                                setIsDriveDropdownOpen(false);
+                                setToast({
+                                  message: `Berhasil menghubungkan file "${file.name}" dari Google Drive! 📂`,
+                                  type: 'success',
+                                });
+                              }}
+                              className="w-full text-left px-3.5 py-2.5 text-xs text-slate-700 dark:text-slate-350 hover:bg-slate-50 dark:hover:bg-slate-900 transition flex items-center gap-2"
+                            >
+                              📊 {file.name}
+                            </button>
+                          ))
+                        )}
+                      </motion.div>
+                    </>
+                  )}
+                </AnimatePresence>
+              </div>
+
+              {/* Active Profile Info */}
+              <div className="hidden lg:flex items-center gap-2 px-3 py-1.5 bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-100 dark:border-emerald-900 rounded-xl text-xs font-bold text-emerald-600 dark:text-emerald-400">
+                {connectedUser?.picture ? (
+                  <img
+                    src={connectedUser.picture}
+                    alt={connectedUser.name}
+                    className="w-4.5 h-4.5 rounded-full border border-emerald-200 flex-shrink-0"
+                  />
+                ) : (
+                  <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse flex-shrink-0" />
+                )}
+                <span className="truncate max-w-[120px]">{connectedUser?.name || 'Connected'}</span>
+              </div>
+
+              <button
+                onClick={handleDisconnectGoogle}
+                className="px-3.5 py-2 bg-rose-50 hover:bg-rose-100 dark:bg-rose-950/20 dark:hover:bg-rose-950/40 text-rose-600 dark:text-rose-400 rounded-xl text-xs font-bold transition"
+              >
+                Putuskan
+              </button>
+            </>
+          ) : (
+            <button
+              onClick={handleConnectGoogle}
+              className="w-full md:w-auto px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold shadow-md hover:shadow-lg transition flex items-center justify-center gap-1.5"
+            >
+              Hubungkan Google Drive 🔑
+            </button>
+          )}
+        </div>
+      </div>
 
       {/* PRINT-ONLY SCHOOL LETTERHEAD */}
       <div className="hidden print:block mb-8 border-b-4 border-double border-slate-900 pb-4">
@@ -554,11 +862,11 @@ export default function Dashboard() {
                   <thead>
                     <tr className="border-b border-slate-100 dark:border-slate-900 text-left">
                       <th className="px-6 py-3.5 text-xs font-bold text-slate-400 uppercase tracking-wider">Row</th>
-                      <th className="px-6 py-3.5 text-xs font-bold text-slate-400 uppercase tracking-wider">Rincian Deskripsi</th>
-                      <th className="px-6 py-3.5 text-xs font-bold text-slate-400 uppercase tracking-wider">Jatuh Tempo</th>
-                      <th className="px-6 py-3.5 text-xs font-bold text-slate-400 uppercase tracking-wider">Metode/Toko</th>
-                      <th className="px-6 py-3.5 text-xs font-bold text-slate-400 uppercase tracking-wider">Nominal Tagihan</th>
-                      <th className="px-6 py-3.5 text-xs font-bold text-slate-400 uppercase tracking-wider">Status</th>
+                      {getTableColumns().map((col) => (
+                        <th key={col} className="px-6 py-3.5 text-xs font-bold text-slate-400 uppercase tracking-wider">
+                          {col}
+                        </th>
+                      ))}
                       <th className="px-6 py-3.5 text-xs font-bold text-slate-400 uppercase tracking-wider text-right print:hidden">Aksi</th>
                     </tr>
                   </thead>
@@ -572,39 +880,82 @@ export default function Dashboard() {
                         <td className="px-6 py-4.5 text-xs font-mono text-slate-400">
                           #{record.rowNumber}
                         </td>
-                        <td className="px-6 py-4.5">
-                          <div className="flex flex-col">
-                            <span className="font-semibold text-slate-700 dark:text-slate-300 text-sm group-hover:text-indigo-600 dark:group-hover:text-indigo-400 transition-colors">
-                              {record.description}
-                            </span>
-                            {record.printable && (
-                              <span className="inline-flex items-center gap-1 text-[10px] text-blue-500 dark:text-blue-400 font-bold mt-1">
-                                <Printer className="w-3 h-3" /> Cetak Bukti
-                              </span>
-                            )}
-                          </div>
-                        </td>
-                        <td className="px-6 py-4.5 text-sm text-slate-500 dark:text-slate-400">
-                          {record.dueDate || '-'}
-                        </td>
-                        <td className="px-6 py-4.5 text-sm text-slate-500 dark:text-slate-400">
-                          {record.store || '-'}
-                        </td>
-                        <td className="px-6 py-4.5 text-sm font-extrabold text-slate-800 dark:text-slate-200">
-                          {formatIDR(record.amount || 0)}
-                        </td>
-                        <td className="px-6 py-4.5">
-                          <span
-                            className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold ${
-                              record.isPaid
-                                ? 'bg-emerald-50 dark:bg-emerald-950/30 text-emerald-600 dark:text-emerald-400'
-                                : 'bg-amber-50 dark:bg-amber-950/30 text-amber-600 dark:text-amber-400'
-                            }`}
-                          >
-                            <span className={`w-1.5 h-1.5 rounded-full ${record.isPaid ? 'bg-emerald-500' : 'bg-amber-500'}`} />
-                            {record.isPaid ? 'Lunas' : 'Belum Bayar'}
-                          </span>
-                        </td>
+                        {getTableColumns().map((col) => {
+                          const rawVal = record.raw[col] || '';
+                          const lowerCol = col.toLowerCase();
+
+                          const isStatus =
+                            lowerCol.includes('sudah') ||
+                            lowerCol.includes('status') ||
+                            lowerCol.includes('lunas') ||
+                            lowerCol.includes('paid') ||
+                            lowerCol.includes('bayar');
+
+                          const isAmount =
+                            lowerCol.includes('tagihan') ||
+                            lowerCol.includes('nominal') ||
+                            lowerCol.includes('amount') ||
+                            lowerCol.includes('biaya') ||
+                            lowerCol.includes('jumlah') ||
+                            lowerCol.includes('total');
+
+                          const isName =
+                            lowerCol.includes('nama') ||
+                            lowerCol.includes('name') ||
+                            lowerCol.includes('description') ||
+                            lowerCol.includes('deskripsi') ||
+                            lowerCol.includes('keterangan') ||
+                            lowerCol.includes('listrik') ||
+                            lowerCol.includes('rincian');
+
+                          if (isStatus) {
+                            return (
+                              <td key={col} className="px-6 py-4.5">
+                                <span
+                                  className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold ${
+                                    record.isPaid
+                                      ? 'bg-emerald-50 dark:bg-emerald-950/30 text-emerald-600 dark:text-emerald-400'
+                                      : 'bg-amber-50 dark:bg-amber-950/30 text-amber-600 dark:text-amber-400'
+                                  }`}
+                                >
+                                  <span className={`w-1.5 h-1.5 rounded-full ${record.isPaid ? 'bg-emerald-500' : 'bg-amber-500'}`} />
+                                  {record.isPaid ? 'Lunas' : 'Belum Bayar'}
+                                </span>
+                              </td>
+                            );
+                          }
+
+                          if (isAmount) {
+                            return (
+                              <td key={col} className="px-6 py-4.5 text-sm font-extrabold text-slate-800 dark:text-slate-200">
+                                {formatIDR(record.amount || 0)}
+                              </td>
+                            );
+                          }
+
+                          if (isName) {
+                            return (
+                              <td key={col} className="px-6 py-4.5">
+                                <div className="flex flex-col">
+                                  <span className="font-semibold text-slate-700 dark:text-slate-300 text-sm group-hover:text-indigo-600 dark:group-hover:text-indigo-400 transition-colors">
+                                    {rawVal || record.name || '-'}
+                                  </span>
+                                  {record.printable && (
+                                    <span className="inline-flex items-center gap-1 text-[10px] text-blue-500 dark:text-blue-400 font-bold mt-1">
+                                      <Printer className="w-3 h-3" /> Cetak Bukti
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
+                            );
+                          }
+
+                          return (
+                            <td key={col} className="px-6 py-4.5 text-sm text-slate-505 dark:text-slate-400">
+                              {rawVal || '-'}
+                            </td>
+                          );
+                        })}
                         <td className="px-6 py-4.5 text-right print:hidden" onClick={(e) => e.stopPropagation()}>
                           <button
                             onClick={() => setSelectedRecord(record)}
@@ -631,7 +982,7 @@ export default function Dashboard() {
                       <div className="flex flex-col">
                         <span className="text-[10px] font-mono text-slate-400">Row #{record.rowNumber}</span>
                         <span className="font-bold text-slate-800 dark:text-slate-200 text-sm mt-0.5">
-                          {record.description}
+                          {record.name}
                         </span>
                       </div>
                       <span
@@ -786,27 +1137,141 @@ export default function Dashboard() {
                         {selectedRecord.printable ? 'Ya (Bisa Cetak)' : 'Tidak'}
                       </span>
                     </div>
+
+                    {selectedRecord.paymentNumber !== undefined && (
+                      <div className="bg-slate-50 dark:bg-slate-900/30 p-3.5 rounded-2xl border border-slate-100/50 dark:border-slate-900/50">
+                        <span className="block text-[10px] text-slate-400 uppercase font-bold">Nomor Pembayaran</span>
+                        <span className="text-sm font-bold text-slate-700 dark:text-slate-300 block mt-1">
+                          {selectedRecord.paymentNumber || '-'}
+                        </span>
+                      </div>
+                    )}
+
+                    {selectedRecord.paymentMethod !== undefined && (
+                      <div className="bg-slate-50 dark:bg-slate-900/30 p-3.5 rounded-2xl border border-slate-100/50 dark:border-slate-900/50">
+                        <span className="block text-[10px] text-slate-400 uppercase font-bold">Metode Pembayaran</span>
+                        <span className="text-sm font-bold text-slate-700 dark:text-slate-300 block mt-1">
+                          {selectedRecord.paymentMethod || '-'}
+                        </span>
+                      </div>
+                    )}
                   </div>
 
                   <div className="bg-slate-50 dark:bg-slate-900/30 p-4 rounded-2xl border border-slate-100/50 dark:border-slate-900/50">
-                    <span className="block text-[10px] text-slate-400 uppercase font-bold">Rincian Deskripsi</span>
+                    <span className="block text-[10px] text-slate-400 uppercase font-bold">Nama (Deskripsi)</span>
                     <span className="text-sm font-bold text-slate-700 dark:text-slate-300 block mt-1">
-                      {selectedRecord.description || '-'}
+                      {selectedRecord.name || '-'}
                     </span>
                   </div>
                 </div>
 
                 {/* Raw Google Sheets Columns */}
                 <div className="space-y-3">
-                  <h5 className="text-xs font-extrabold text-slate-400 uppercase tracking-wider">Kolom Asli Spreadsheet</h5>
-                  <div className="border border-slate-100 dark:border-slate-900 rounded-2xl overflow-hidden divide-y divide-slate-100 dark:divide-slate-900">
-                    {Object.entries(selectedRecord.raw).map(([key, val]) => (
-                      <div key={key} className="flex justify-between items-center p-3 text-xs">
-                        <span className="font-semibold text-slate-400">{key}</span>
-                        <span className="font-bold text-slate-700 dark:text-slate-300">{val || '—'}</span>
-                      </div>
-                    ))}
+                {/* Raw Google Sheets Columns & Edit form toggle */}
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <h5 className="text-xs font-extrabold text-slate-400 uppercase tracking-wider">
+                      {isEditingForm ? 'Edit Data Kolom' : 'Kolom Asli Spreadsheet'}
+                    </h5>
+                    <button
+                      onClick={() => setIsEditingForm(!isEditingForm)}
+                      className="text-xs font-bold text-indigo-600 hover:text-indigo-700 dark:text-indigo-400 transition"
+                    >
+                      {isEditingForm ? 'Batal ❌' : 'Edit Semua Kolom ✏️'}
+                    </button>
                   </div>
+
+                  {isEditingForm ? (
+                    <form onSubmit={handleSaveRowForm} className="space-y-4">
+                      <div className="space-y-3 max-h-[300px] overflow-y-auto pr-1">
+                        {Object.keys(formValues).map((key) => {
+                          const lowerKey = key.toLowerCase();
+                          
+                          // Check if this is the payment method column
+                          const isPaymentMethod = 
+                            lowerKey.includes('metode pembayaran') || 
+                            lowerKey.includes('metode') || 
+                            lowerKey.includes('payment method') || 
+                            lowerKey.includes('payment_method') || 
+                            lowerKey.includes('cara bayar');
+
+                          // Check if this is status
+                          const isStatus = 
+                            lowerKey.includes('sudah') || 
+                            lowerKey.includes('status') || 
+                            lowerKey.includes('lunas') || 
+                            lowerKey.includes('paid') || 
+                            lowerKey.includes('bayar');
+
+                          if (isPaymentMethod) {
+                            return (
+                              <div key={key} className="flex flex-col gap-1 text-left">
+                                <label className="text-[10px] font-bold text-slate-450 dark:text-slate-400 uppercase">{key}</label>
+                                <select
+                                  value={formValues[key] || ''}
+                                  onChange={(e) => handleInputChange(key, e.target.value)}
+                                  className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-700 dark:text-slate-200"
+                                >
+                                  <option value="">-- Pilih Metode --</option>
+                                  <option value="Blibli">Blibli</option>
+                                  <option value="Tokopedia">Tokopedia</option>
+                                  <option value="Shopee">Shopee</option>
+                                  <option value="via Aplikasi">via Aplikasi</option>
+                                </select>
+                              </div>
+                            );
+                          }
+
+                          if (isStatus) {
+                            return (
+                              <div key={key} className="flex flex-col gap-1 text-left">
+                                <label className="text-[10px] font-bold text-slate-455 dark:text-slate-400 uppercase">{key}</label>
+                                <select
+                                  value={formValues[key] || ''}
+                                  onChange={(e) => handleInputChange(key, e.target.value)}
+                                  className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-700 dark:text-slate-200"
+                                >
+                                  <option value="TRUE">TRUE (Lunas)</option>
+                                  <option value="FALSE">FALSE (Belum Bayar)</option>
+                                </select>
+                              </div>
+                            );
+                          }
+
+                          return (
+                            <div key={key} className="flex flex-col gap-1 text-left">
+                              <label className="text-[10px] font-bold text-slate-450 dark:text-slate-400 uppercase">{key}</label>
+                              <input
+                                type="text"
+                                value={formValues[key] || ''}
+                                onChange={(e) => handleInputChange(key, e.target.value)}
+                                className="w-full px-3 py-2 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-700 dark:text-slate-200"
+                              />
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={isUpdating}
+                        className="w-full py-2.5 px-4 bg-indigo-650 hover:bg-indigo-700 text-white rounded-xl font-bold shadow-md hover:shadow-lg disabled:opacity-75 transition text-xs flex items-center justify-center gap-2 mt-4"
+                      >
+                        {isUpdating && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                        <span>Simpan Perubahan 💾</span>
+                      </button>
+                    </form>
+                  ) : (
+                    <div className="border border-slate-100 dark:border-slate-900 rounded-2xl overflow-hidden divide-y divide-slate-100 dark:divide-slate-900">
+                      {Object.entries(selectedRecord.raw).map(([key, val]) => (
+                        <div key={key} className="flex justify-between items-center p-3 text-xs">
+                          <span className="font-semibold text-slate-400">{key}</span>
+                          <span className="font-bold text-slate-700 dark:text-slate-300">{val || '—'}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
                 </div>
               </div>
 

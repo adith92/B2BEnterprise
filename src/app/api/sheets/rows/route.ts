@@ -15,13 +15,14 @@ export async function GET(request: NextRequest) {
 
   try {
     const rawRows = await getSpreadsheetRows(sheetName);
-    const normalized = normalizeBillingRows(rawRows);
+    const { records, columns } = normalizeBillingRows(rawRows);
     return NextResponse.json({
       success: true,
       sheetName,
       totalRawRows: rawRows.length,
-      totalNormalizedRecords: normalized.length,
-      records: normalized,
+      totalNormalizedRecords: records.length,
+      columns,
+      records,
     });
   } catch (error: any) {
     return NextResponse.json(

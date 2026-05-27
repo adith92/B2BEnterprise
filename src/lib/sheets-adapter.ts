@@ -2,7 +2,9 @@ export type BillingRecord = {
   rowNumber: number;
   category?: string;
   isPaid?: boolean;
-  description?: string;
+  name?: string;
+  paymentNumber?: string;
+  paymentMethod?: string;
   customerName?: string;
   customerId?: string;
   amount?: number;
@@ -12,12 +14,19 @@ export type BillingRecord = {
   raw: Record<string, string>;
 };
 
+export type NormalizedResult = {
+  records: BillingRecord[];
+  columns: string[];
+};
+
 /**
  * Normalizes raw Google Sheets rows (2D array) into standard BillingRecord array.
  * Preserves the 1-based row number from Google Sheets.
  */
-export const normalizeBillingRows = (rawRows: any[][]): BillingRecord[] => {
-  if (!rawRows || rawRows.length === 0) return [];
+export const normalizeBillingRows = (rawRows: any[][]): NormalizedResult => {
+  if (!rawRows || rawRows.length === 0) {
+    return { records: [], columns: [] };
+  }
 
   // 1. Identify the header row dynamically
   const headerKeywords = [
@@ -26,6 +35,8 @@ export const normalizeBillingRows = (rawRows: any[][]): BillingRecord[] => {
     'lunas',
     'paid',
     'bayar',
+    'name',
+    'nama',
     'description',
     'deskripsi',
     'keterangan',
@@ -41,6 +52,12 @@ export const normalizeBillingRows = (rawRows: any[][]): BillingRecord[] => {
     'store',
     'tempo',
     'due',
+    'nomor pembayaran',
+    'no pembayaran',
+    'payment number',
+    'metode pembayaran',
+    'metode',
+    'payment method',
   ];
 
   let bestHeaderRowIndex = 0;
@@ -79,7 +96,9 @@ export const normalizeBillingRows = (rawRows: any[][]): BillingRecord[] => {
 
   // Detect column mapping based on keywords
   let isPaidColIndex = -1;
-  let descriptionColIndex = -1;
+  let nameColIndex = -1;
+  let paymentNumberColIndex = -1;
+  let paymentMethodColIndex = -1;
   let amountColIndex = -1;
   let printColIndex = -1;
   let storeColIndex = -1;
@@ -97,13 +116,31 @@ export const normalizeBillingRows = (rawRows: any[][]): BillingRecord[] => {
     ) {
       if (isPaidColIndex === -1) isPaidColIndex = c;
     } else if (
+      label.includes('nomor pembayaran') ||
+      label.includes('no pembayaran') ||
+      label.includes('payment number') ||
+      label.includes('payment_number') ||
+      label.includes('payment no')
+    ) {
+      if (paymentNumberColIndex === -1) paymentNumberColIndex = c;
+    } else if (
+      label.includes('metode pembayaran') ||
+      label.includes('metode') ||
+      label.includes('payment method') ||
+      label.includes('payment_method') ||
+      label.includes('cara bayar')
+    ) {
+      if (paymentMethodColIndex === -1) paymentMethodColIndex = c;
+    } else if (
+      label.includes('nama') ||
+      label.includes('name') ||
       label.includes('description') ||
       label.includes('deskripsi') ||
       label.includes('keterangan') ||
       label.includes('listrik') ||
       label.includes('rincian')
     ) {
-      if (descriptionColIndex === -1) descriptionColIndex = c;
+      if (nameColIndex === -1) nameColIndex = c;
     } else if (
       label.includes('tagihan') ||
       label.includes('nominal') ||
@@ -203,16 +240,18 @@ export const normalizeBillingRows = (rawRows: any[][]): BillingRecord[] => {
     // Identify categories (e.g. if row only has 1 or 2 fields and they look like section title, like 'LISTRIK')
     const nonPrefixedVals = row.filter((val) => val && String(val).trim() !== '');
     let category: string | undefined;
-    if (nonPrefixedVals.length === 1 && descriptionColIndex !== -1 && row[descriptionColIndex]) {
+    if (nonPrefixedVals.length === 1 && nameColIndex !== -1 && row[nameColIndex]) {
       // If it's a single cell row containing text, it might be a section category header
-      category = String(row[descriptionColIndex]).trim();
+      category = String(row[nameColIndex]).trim();
     }
 
     const record: BillingRecord = {
       rowNumber,
       category,
       isPaid: isPaidColIndex !== -1 ? parsePaid(row[isPaidColIndex]) : false,
-      description: descriptionColIndex !== -1 ? String(row[descriptionColIndex] || '').trim() : undefined,
+      name: nameColIndex !== -1 ? String(row[nameColIndex] || '').trim() : undefined,
+      paymentNumber: paymentNumberColIndex !== -1 ? String(row[paymentNumberColIndex] || '').trim() : undefined,
+      paymentMethod: paymentMethodColIndex !== -1 ? String(row[paymentMethodColIndex] || '').trim() : undefined,
       amount: amountColIndex !== -1 ? parseAmount(row[amountColIndex]) : 0,
       printable: printColIndex !== -1 ? parsePaid(row[printColIndex]) : undefined,
       store: storeColIndex !== -1 ? String(row[storeColIndex] || '').trim() : undefined,
@@ -234,5 +273,10 @@ export const normalizeBillingRows = (rawRows: any[][]): BillingRecord[] => {
   }
 
   // Filter out the category-only rows from the final billing records list if they have no amount/description
-  return records.filter((r) => r.description && r.description !== r.category);
+  const filteredRecords = records.filter((r) => r.name && r.name !== r.category);
+
+  return {
+    records: filteredRecords,
+    columns: colLabels,
+  };
 };
